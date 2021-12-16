@@ -23,6 +23,7 @@ class Encoder(nn.Module):
         for name, param in self.bertModel.named_parameters():
             param.requires_grad = False
         self.rnn = nn.GRU(input_size=hiddenSize, hidden_size=hiddenSize, bidirectional=True)
+        self.fc = nn.Linear(hiddenSize*3, hiddenSize)
         self.norm = nn.LayerNorm(hiddenSize)
 
     def forward(self, input):
@@ -33,8 +34,11 @@ class Encoder(nn.Module):
         bert_encoder_hidden = bert_encoder_hidden.unsqueeze(0).expand(2,bert_encoder_hidden.shape[0], bert_encoder_hidden.shape[1])
         gru_encoder_output, gru_encoder_hidden = self.rnn(embedding, bert_encoder_hidden)
         # 加入BiGRU，在bert的词表示上建模，再与bert的cls做一个相加
-        gru_encoder_hidden = torch.add(gru_encoder_hidden[-1], gru_encoder_hidden[-2]).unsqueeze(0)
-        encoder_hidden_output = torch.add(bert_encoder_hidden[0].unsqueeze(0), gru_encoder_hidden)
+        gru_encoder_hidden = torch.cat((gru_encoder_hidden[-1], gru_encoder_hidden[-2]),dim=1).unsqueeze(0)
+        encoder_hidden_output = torch.cat((bert_encoder_hidden[0].unsqueeze(0), gru_encoder_hidden), dim=2)
+        #加一个现形激活层
+        encoder_hidden_output = F.tanh(self.fc(encoder_hidden_output))
+
         # output = self.x(output, dim=1)
         return encoder_hidden_output
 
@@ -49,8 +53,8 @@ class Decoder(nn.Module):
             param.requires_grad = False
         self.rnn = nn.GRU(input_size=dec_inputSize, hidden_size=hiddenSize,
                         dropout=dropout)
-        self.norm = nn.LayerNorm(dec_inputSize)
         self.fc = nn.Linear(dec_inputSize, vocabSize)
+        self.norm = nn.LayerNorm(vocabSize)
         self.sf = nn.Softmax(dim=2)
 
     def forward(self, enc_output_hidden, dec_input, mode=0):
@@ -63,7 +67,7 @@ class Decoder(nn.Module):
                 # input = torch.cat((enc_output_hidden, dec_input[i-1].unsqueeze(0)), dim=2)
             # input = dec_input[i-1].unsqueeze(0)
             output,_ = self.rnn(dec_input, enc_output_hidden)
-            output = self.sf(self.fc(self.norm(output)))
+            output = self.sf((self.norm(self.fc(F.tanh(output)))))
 
             # outputs[i-1] = self.sf(fc_output)
             #     enc_output_hidden = output
@@ -77,19 +81,24 @@ class Decoder(nn.Module):
             outputs = torch.zeros(self.max_len, 1 ,self.outputSize)
             end_flag = "[SEP]"
             true_len = 0
+            pre_wordIdList = [bertTokenizer.convert_tokens_to_ids("[CLS]")]
+
             for i in range(self.max_len):
                 output, hidden = self.rnn(dec_input, enc_output_hidden) # 1 * batchsize * 768
 
-
-
-                pre_out = self.sf(self.fc(self.norm(output))).squeeze(0) # seq * 30522
+                pre_out = self.sf((self.norm(self.fc(F.tanh(output))))).squeeze(0) # seq * 30522
                 pre_word = bertTokenizer.decode(torch.tensor(pre_out.argmax(1))) # 输出一个预测词
                 if(pre_word == end_flag):
                     break;
                 else:
                     outputs[i] = pre_out
-                    pre_word = bertTokenizer(text=pre_word, return_tensors='pt', padding=True)
-                    dec_input = self.bertModel(**pre_word)['last_hidden_state'].transpose(0,1)[1:2,:,:]
+
+                    pre_word = bertTokenizer.convert_tokens_to_ids(pre_word)
+                    pre_wordIdList.append(pre_word)
+                    type = [1] * len(pre_wordIdList)
+                    bert_embedding_output = self.bertModel(torch.tensor(pre_wordIdList).unsqueeze(0), torch.tensor(type).unsqueeze(0))['last_hidden_state'].transpose(0,1)
+                    dec_input = bert_embedding_output[-1:, : , :]
+                    # dec_input = output
                     enc_output_hidden = hidden
                     true_len += 1
 
@@ -126,7 +135,7 @@ model = Seq2seq(encoder,decoder)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-for epoch in range(200):
+for epoch in range(500):
     model.train()
     iteration = 0
     epoch_loss = 0
