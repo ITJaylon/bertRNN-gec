@@ -1,3 +1,5 @@
+import time
+
 import torch
 from transformers import BertTokenizer, BertModel, BertForMaskedLM
 from torch import nn
@@ -5,16 +7,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from util import process
+import matplotlib.pyplot as plt
+import numpy as np
 
 err_path = "../data/err_1.txt"
 cor_path = "../data/cor_1.txt"
 err_text, cor_text = process.makeData(err_path, cor_path)
 
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 dataset = process.MyDataSet(err_text, cor_text)
 data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-BertModel_DIR = "../../BertTest/bert-base-uncased"
+BertModel_DIR = "../../GEC_CN/GEC_CN/bert-base-uncased"
+# BertModel_DIR = "../../bert-base-uncased"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Encoder(nn.Module):
     def __init__(self, hiddenSize):
@@ -30,17 +36,36 @@ class Encoder(nn.Module):
         embedding = self.bertModel(**input)['last_hidden_state'] # **input 指的是去除了字典的值
         # embedding = [batch * seq * hiddensize]
         bert_encoder_hidden = embedding.transpose(0,1)[0]
-        embedding = embedding.transpose(0, 1)
-        bert_encoder_hidden = bert_encoder_hidden.unsqueeze(0).expand(2,bert_encoder_hidden.shape[0], bert_encoder_hidden.shape[1])
+        embedding = embedding.transpose(0, 1).contiguous()
+        bert_encoder_hidden = bert_encoder_hidden.unsqueeze(0).expand(2,bert_encoder_hidden.shape[0], bert_encoder_hidden.shape[1]).contiguous()
         gru_encoder_output, gru_encoder_hidden = self.rnn(embedding, bert_encoder_hidden)
         # 加入BiGRU，在bert的词表示上建模，再与bert的cls做一个相加
         gru_encoder_hidden = torch.cat((gru_encoder_hidden[-1], gru_encoder_hidden[-2]),dim=1).unsqueeze(0)
         encoder_hidden_output = torch.cat((bert_encoder_hidden[0].unsqueeze(0), gru_encoder_hidden), dim=2)
         #加一个现形激活层
-        encoder_hidden_output = F.tanh(self.fc(encoder_hidden_output))
+        encoder_hidden_output = torch.tanh(self.fc(encoder_hidden_output))
 
         # output = self.x(output, dim=1)
         return encoder_hidden_output
+
+
+class Attention():
+    def __init__(self, kSize, qSize):
+        self.fq = nn.Linear(kSize, qSize)
+        self.softmax = nn.Softmax(dim=1)
+        self.norm = nn.LayerNorm(qSize)
+
+    def forward(self, input, query):
+        key = self.fq(input)
+        # key = [batch * seq * querySize]
+        dot = torch.dot(key, query)/np.sqrt(key.shape[2])
+        # dot = [batch * seq]
+        dot = self.softmax(dot)
+        value = dot * input
+        # TODO:加入注意力机制
+        value = nn.layersum(torch.sum(value, dim=1))
+        #value = [batch * querySize]
+        return value
 
 class Decoder(nn.Module):
     def __init__(self, hiddenSize, dec_inputSize, vocabSize, max_len, dropout = 0.2):
@@ -51,10 +76,14 @@ class Decoder(nn.Module):
         self.bertModel = BertModel.from_pretrained(BertModel_DIR)
         for name, param in self.bertModel.named_parameters():
             param.requires_grad = False
-        self.rnn = nn.GRU(input_size=dec_inputSize, hidden_size=hiddenSize,
+        self.rnn = nn.GRU(input_size=dec_inputSize, hidden_size=hiddenSize, bias=True, num_layers=2,
                         dropout=dropout)
+
+        # 此处巧合，q和k的维度是一样
+        self.attention = Attention(hiddenSize, hiddenSize)
+
         self.fc = nn.Linear(dec_inputSize, vocabSize)
-        self.norm = nn.LayerNorm(vocabSize)
+        # self.norm = nn.LayerNorm(vocabSize)
         self.sf = nn.Softmax(dim=2)
 
     def forward(self, enc_output_hidden, dec_input, mode=0):
@@ -66,8 +95,11 @@ class Decoder(nn.Module):
             # for i in range(1, dec_input.shape[0]):
                 # input = torch.cat((enc_output_hidden, dec_input[i-1].unsqueeze(0)), dim=2)
             # input = dec_input[i-1].unsqueeze(0)
-            output,_ = self.rnn(dec_input, enc_output_hidden)
-            output = self.sf((self.norm(self.fc(F.tanh(output)))))
+            output,_ = self.rnn(dec_input, enc_output_hidden.expand(2, enc_output_hidden.shape[1], enc_output_hidden.shape[2]).contiguous())
+
+            # 输出经过attention层
+
+            output = self.fc(torch.tanh(output))
 
             # outputs[i-1] = self.sf(fc_output)
             #     enc_output_hidden = output
@@ -78,16 +110,16 @@ class Decoder(nn.Module):
             # dec_input = seq * batchsize * inputsize
             dec_input = self.bertModel(**dec_input)['last_hidden_state'].transpose(0,1)[:-1,:,:]
             # 接下来测试模式的解码策略采用集束搜索，生成单词时，遇到【seq】代表停止
-            outputs = torch.zeros(self.max_len, 1 ,self.outputSize)
+            outputs = torch.zeros(self.max_len, 1 ,self.outputSize).to(device)
             end_flag = "[SEP]"
             true_len = 0
             pre_wordIdList = [bertTokenizer.convert_tokens_to_ids("[CLS]")]
 
             for i in range(self.max_len):
-                output, hidden = self.rnn(dec_input, enc_output_hidden) # 1 * batchsize * 768
+                output, hidden = self.rnn(dec_input, enc_output_hidden.expand(2, enc_output_hidden.shape[1], enc_output_hidden.shape[2]).contiguous()) # 1 * batchsize * 768
 
-                pre_out = self.sf((self.norm(self.fc(F.tanh(output))))).squeeze(0) # seq * 30522
-                pre_word = bertTokenizer.decode(torch.tensor(pre_out.argmax(1))) # 输出一个预测词
+                pre_out = self.sf(self.fc(torch.tanh(output))).squeeze(0) # seq * 30522
+                pre_word = bertTokenizer.decode(pre_out.argmax(1).clone().detach()) # 输出一个预测词
                 if(pre_word == end_flag):
                     break;
                 else:
@@ -96,7 +128,7 @@ class Decoder(nn.Module):
                     pre_word = bertTokenizer.convert_tokens_to_ids(pre_word)
                     pre_wordIdList.append(pre_word)
                     type = [1] * len(pre_wordIdList)
-                    bert_embedding_output = self.bertModel(torch.tensor(pre_wordIdList).unsqueeze(0), torch.tensor(type).unsqueeze(0))['last_hidden_state'].transpose(0,1)
+                    bert_embedding_output = self.bertModel(torch.tensor(pre_wordIdList).unsqueeze(0).to(device), torch.tensor(type).unsqueeze(0).to(device))['last_hidden_state'].transpose(0,1)
                     dec_input = bert_embedding_output[-1:, : , :]
                     # dec_input = output
                     enc_output_hidden = hidden
@@ -125,7 +157,7 @@ vocabSize = len(bertTokenizer)
 
 encoder = Encoder(768)
 decoder = Decoder(768, 768, vocabSize, 128)
-model = Seq2seq(encoder,decoder)
+model = Seq2seq(encoder,decoder).to(device)
 # input = bertTokenizer(text=s, return_tensors='pt', padding=True)
 # # print(input)
 # output = model(input)
@@ -134,14 +166,25 @@ model = Seq2seq(encoder,decoder)
 # print(trg)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+epochtimes = 500
+epoch_time_list = []
+epoch_loss_list = []
 
-for epoch in range(500):
+def drawLoss():
+    plt.xlabel("epoch time")  # x轴上的名字
+    plt.ylabel("epoch loss")  # y轴上的名字
+    plt.plot(epoch_time_list, epoch_loss_list, color='blue', linewidth=2)
+    plt.show()
+
+start_time = time.time()
+for epoch in range(epochtimes):
     model.train()
     iteration = 0
     epoch_loss = 0
+    epoch_start_time = time.time()
     for err_text, cor_text in data_loader:
-        input = bertTokenizer(text=err_text, return_tensors='pt', padding=True)
-        trg = bertTokenizer(text=cor_text, return_tensors='pt', padding=True)
+        input = bertTokenizer(text=err_text, return_tensors='pt', padding=True).to(device)
+        trg = bertTokenizer(text=cor_text, return_tensors='pt', padding=True).to(device)
         output = model(input, trg)
         trg = F.one_hot(trg['input_ids'][:,1:], num_classes=vocabSize).float()
 
@@ -151,19 +194,33 @@ for epoch in range(500):
         optimizer.step()
         epoch_loss += loss.item()
         iteration = iteration+1
-        output = torch.tensor(output.transpose(0,1).argmax(2, keepdim=True))
-        for batch in range(output.shape[0]):
-            print(bertTokenizer.decode(output.squeeze(2)[batch]))
+        output = output.transpose(0,1).argmax(2, keepdim=True).clone().detach()
+        # for batch in range(output.shape[0]):
+        #     print(bertTokenizer.decode(output.squeeze(2)[batch]))
         print('Epoch:', '%02d' % (epoch + 1), 'Iteration:', '%02d' % iteration, 'batch-loss = ',
-              '{:.6f}'.format(epoch_loss / BATCH_SIZE))
+              '{:.6f}'.format(loss.item()))
+    epoch_end_time = time.time()
+    print('Epoch:', '%02d' % (epoch + 1), 'epoch-loss = ',
+        '{:.6f}'.format(epoch_loss), 'time-cost =', '{%d s}' % (epoch_end_time - epoch_start_time))
+
+    epoch_time_list.append(epoch + 1)
+    epoch_loss_list.append(epoch_loss)
+    if (epoch + 1) % 50 == 0:
+        drawLoss()
+
+end_time = time.time()
+print('total-time-cost =', '{%d s}' % (end_time - start_time))
+drawLoss()
+
+
 
 def test(test_path, cor_path):
     # TODO:测试集上测试效果,beam search size= 1
     cor_text = []
     with open(test_path, encoding='utf-8') as f1:
         for line in f1.readlines():
-            input = bertTokenizer(text=line.strip(), return_tensors='pt', padding=True)
-            trg = bertTokenizer(text="", return_tensors='pt', padding=True)
+            input = bertTokenizer(text=line.strip(), return_tensors='pt', padding=True).to(device)
+            trg = bertTokenizer(text="", return_tensors='pt', padding=True).to(device)
             output = model(input, trg, 1)
             cor_text.append(bertTokenizer.decode(output.transpose(0,1).argmax(2, keepdim=True).squeeze(2)[0]))
 
